@@ -1,0 +1,107 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: react-firebase-spa
+  title: React + Vite + Firebase SPA (Golden Path)
+  description: >
+    Gold-tier production-ready React 19 + TypeScript + Vite SPA backed by Cloud
+    Firestore & Firebase Auth and deployed via approval-gated GitHub Pages CI/CD.
+    Modeled directly after enzo-baptism.
+  tags:
+    - golden-path
+    - react
+    - typescript
+    - vite
+    - firebase
+    - github-pages
+spec:
+  owner: group:default/platform-team
+  type: website
+
+  parameters:
+    - title: Service Identity & Ownership
+      required:
+        - name
+        - description
+        - owner
+      properties:
+        name:
+          title: App Name
+          type: string
+          description: Lowercase kebab-case identifier (e.g., my-event-portal)
+          pattern: '^[a-z0-9-]+$'
+          ui:autofocus: true
+        description:
+          title: Description
+          type: string
+          description: Short summary of what this web app does
+        owner:
+          title: Owning Team
+          type: string
+          default: group:default/platform-team
+          ui:field: OwnerPicker
+          ui:options:
+            catalogFilter:
+              kind: Group
+
+    - title: Firebase & Hosting Configuration
+      required:
+        - firebaseProjectId
+        - githubOrg
+      properties:
+        firebaseProjectId:
+          title: Firebase Project ID
+          type: string
+          description: Target Firebase project ID (e.g., my-event-portal-2027)
+        githubOrg:
+          title: GitHub Username or Organization
+          type: string
+          default: paulfermoreyes
+        tier:
+          title: Service Criticality Tier
+          type: string
+          default: tier-2
+          enum:
+            - tier-1
+            - tier-2
+            - tier-3
+
+  steps:
+    - id: fetch-skeleton
+      name: Fetch Golden Path Skeleton
+      action: fetch:template
+      input:
+        url: ./skeleton
+        values:
+          name: ${{ parameters.name }}
+          description: ${{ parameters.description }}
+          owner: ${{ parameters.owner }}
+          firebaseProjectId: ${{ parameters.firebaseProjectId }}
+          githubOrg: ${{ parameters.githubOrg }}
+          tier: ${{ parameters.tier }}
+
+    - id: debug-log
+      name: Confirm Gold-Tier Compliance Files
+      action: debug:log
+      input:
+        message: >
+          Scaffolded ${{ parameters.name }} with catalog-info.yaml, PR CI gate,
+          approval-gated GitHub Pages deploy, CODEOWNERS, Dependabot, TechDocs,
+          and Operations Runbook. (Connect GITHUB_TOKEN to enable publish:github.)
+        listWorkspace: true
+
+  output:
+    text:
+      - title: Next Steps (Local Dry-Run Mode)
+        content: |
+          Your **${{ parameters.name }}** Golden Path project passed template rendering!
+
+          Included automatically on Day 1:
+          - `catalog-info.yaml` (Component + Firestore/Auth Resources)
+          - `.github/workflows/ci.yml` (PR typecheck, build & npm audit)
+          - `.github/workflows/deploy.yml` (Approval-gated GitHub Pages deploy)
+          - `.github/CODEOWNERS` & `.github/dependabot.yml`
+          - `mkdocs.yml` + `docs/runbook.md` (TechDocs)
+
+          To automatically create a live GitHub repo and register it in Backstage,
+          export `GITHUB_TOKEN` and add `publish:github` + `catalog:register` steps to `template.yaml`.

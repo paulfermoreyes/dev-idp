@@ -69,4 +69,7 @@ backend.add(import('@backstage/plugin-signals-backend'));
 // mcp actions plugin
 backend.add(import('@backstage/plugin-mcp-actions-backend'));
 
+// custom platform insights plugin (Scorecards & DORA metrics)
+backend.add(import('./plugins/platformInsights'));
+
 backend.start();

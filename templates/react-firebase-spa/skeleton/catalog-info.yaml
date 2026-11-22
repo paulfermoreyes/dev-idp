@@ -1,0 +1,20 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: ${{ values.name | dump }}
+  description: ${{ values.description | dump }}
+  tags:
+    - react
+    - typescript
+    - vite
+    - firebase
+    - golden-path
+  annotations:
+    github.com/project-slug: ${{ values.githubOrg }}/${{ values.name }}
+    backstage.io/techdocs-ref: dir:.
+    idp.dev/tier: ${{ values.tier }}
+    idp.dev/golden-path: react-firebase-spa
+spec:
+  type: website
+  lifecycle: production
+  owner: ${{ values.owner | dump }}

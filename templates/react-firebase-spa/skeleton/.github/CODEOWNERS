@@ -1,0 +1,3 @@
+* @${{ values.githubOrg }}
+/.github/ @${{ values.githubOrg }}
+/catalog-info.yaml @${{ values.githubOrg }}
