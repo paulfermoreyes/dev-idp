@@ -13,6 +13,7 @@ import {
   Divider,
   Grid,
   LinearProgress,
+  Link,
   Paper,
   Table,
   TableBody,
@@ -57,9 +58,26 @@ interface DeliveryEvent {
   category: 'feature' | 'fix' | 'revert' | 'chore';
 }
 
+interface WorkflowRunSummary {
+  id: number;
+  name: string;
+  workflowPath: string;
+  status: string;
+  conclusion: string | null;
+  branch: string;
+  sha: string;
+  commitMessage: string;
+  createdAt: string;
+  updatedAt: string;
+  durationSeconds: number;
+  htmlUrl: string;
+  isDeployment: boolean;
+}
+
 interface PlatformInsightsReport {
   entityName: string;
   repoPath: string;
+  projectSlug: string | null;
   evaluatedAt: string;
   scorecard: {
     score: number;
@@ -70,13 +88,17 @@ interface PlatformInsightsReport {
     checks: ScorecardCheck[];
   };
   dora: {
+    source: 'github-actions' | 'git-fallback';
+    sourceNote: string;
     windowDays: number;
     totalCommits: number;
+    totalDeployRuns: number;
     deploymentFrequency: DoraMetric;
     leadTimeForChanges: DoraMetric;
     changeFailureRate: DoraMetric;
     meanTimeToRecovery: DoraMetric;
     recentDeliveries: DeliveryEvent[];
+    workflowRuns: WorkflowRunSummary[];
   };
 }
 
@@ -106,6 +128,21 @@ function getBandColor(band: DoraMetric['band']): { bg: string; fg: string } {
   }
 }
 
+function getConclusionColor(conclusion: string | null): { bg: string; fg: string } {
+  if (conclusion === 'success') return { bg: '#dcfce7', fg: '#166534' };
+  if (conclusion === 'failure' || conclusion === 'timed_out')
+    return { bg: '#fee2e2', fg: '#991b1b' };
+  if (conclusion === 'cancelled') return { bg: '#e5e7eb', fg: '#374151' };
+  return { bg: '#fef3c7', fg: '#92400e' };
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const mins = Math.floor(seconds / 60);
+  const rem = seconds % 60;
+  return `${mins}m ${rem}s`;
+}
+
 function usePlatformInsights() {
   const { entity } = useEntity();
   const discoveryApi = useApi(discoveryApiRef);
@@ -116,6 +153,7 @@ function usePlatformInsights() {
   const [error, setError] = useState<string | null>(null);
 
   const repoPath = entity.metadata.annotations?.['idp.dev/local-repo-path'];
+  const projectSlug = entity.metadata.annotations?.['github.com/project-slug'];
   const entityName = entity.metadata.name;
 
   const load = useCallback(async () => {
@@ -131,10 +169,14 @@ function usePlatformInsights() {
     setError(null);
     try {
       const baseUrl = await discoveryApi.getBaseUrl('platform-insights');
-      const url = `${baseUrl}/evaluate?entityName=${encodeURIComponent(
+      const params = new URLSearchParams({
         entityName,
-      )}&repoPath=${encodeURIComponent(repoPath)}`;
-      const res = await fetchApi.fetch(url);
+        repoPath,
+      });
+      if (projectSlug) {
+        params.set('projectSlug', projectSlug);
+      }
+      const res = await fetchApi.fetch(`${baseUrl}/evaluate?${params.toString()}`);
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error || `HTTP ${res.status}`);
@@ -146,7 +188,7 @@ function usePlatformInsights() {
     } finally {
       setLoading(false);
     }
-  }, [discoveryApi, fetchApi, entityName, repoPath]);
+  }, [discoveryApi, fetchApi, entityName, repoPath, projectSlug]);
 
   useEffect(() => {
     load();
@@ -190,7 +232,11 @@ export const PlatformInsightsOverviewCard = () => {
   return (
     <InfoCard
       title="Production Readiness & DORA"
-      subheader={`Evaluated live from ${report.repoPath}`}
+      subheader={
+        report.dora.source === 'github-actions'
+          ? `Live GitHub Actions (${report.projectSlug})`
+          : `Local Git fallback (${report.repoPath})`
+      }
       action={
         <Button size="small" startIcon={<RefreshIcon />} onClick={reload}>
           Re-evaluate
@@ -257,7 +303,7 @@ export const PlatformInsightsOverviewCard = () => {
 
 /**
  * Full Entity Tab ("Scorecards & DORA") with Pillar Breakdown, Remediation Hints,
- * DORA Benchmarks, and Recent Delivery Timeline.
+ * Live GitHub Actions DORA Benchmarks, Pipeline Runs, and Recent Delivery Timeline.
  */
 export const PlatformInsightsPage = () => {
   const { report, loading, error, reload } = usePlatformInsights();
@@ -354,7 +400,24 @@ export const PlatformInsightsPage = () => {
       <Grid item xs={12}>
         <InfoCard
           title="DORA Delivery Metrics"
-          subheader={`Computed from ${report.dora.totalCommits} commits across ${report.dora.windowDays} day(s) of Git delivery history`}
+          subheader={report.dora.sourceNote}
+          action={
+            <Chip
+              size="small"
+              label={
+                report.dora.source === 'github-actions'
+                  ? 'Live GitHub Actions'
+                  : 'Git Fallback'
+              }
+              style={{
+                backgroundColor:
+                  report.dora.source === 'github-actions' ? '#dcfce7' : '#fef3c7',
+                color:
+                  report.dora.source === 'github-actions' ? '#166534' : '#92400e',
+                fontWeight: 700,
+              }}
+            />
+          }
         >
           <Grid container spacing={2}>
             {doraList.map(metric => {
@@ -389,6 +452,68 @@ export const PlatformInsightsPage = () => {
           </Grid>
         </InfoCard>
       </Grid>
+
+      {/* Live GitHub Actions Pipeline Runs */}
+      {report.dora.workflowRuns.length > 0 && (
+        <Grid item xs={12}>
+          <InfoCard
+            title="Live GitHub Actions Pipeline Runs"
+            subheader={`Latest CI/CD runs fetched from github.com/${report.projectSlug}`}
+          >
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>Workflow</TableCell>
+                  <TableCell>Type</TableCell>
+                  <TableCell>Result</TableCell>
+                  <TableCell>Commit</TableCell>
+                  <TableCell>Duration</TableCell>
+                  <TableCell align="right">Triggered</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {report.dora.workflowRuns.map(run => {
+                  const statusStyle = getConclusionColor(run.conclusion);
+                  return (
+                    <TableRow key={run.id}>
+                      <TableCell>
+                        <Link href={run.htmlUrl} target="_blank" rel="noopener noreferrer">
+                          {run.name}
+                        </Link>
+                      </TableCell>
+                      <TableCell>
+                        <Chip
+                          size="small"
+                          label={run.isDeployment ? 'Deploy' : 'CI'}
+                          variant="outlined"
+                        />
+                      </TableCell>
+                      <TableCell>
+                        <Chip
+                          size="small"
+                          label={run.conclusion || run.status}
+                          style={{
+                            backgroundColor: statusStyle.bg,
+                            color: statusStyle.fg,
+                            fontWeight: 600,
+                          }}
+                        />
+                      </TableCell>
+                      <TableCell>
+                        <code>{run.sha}</code> {run.commitMessage}
+                      </TableCell>
+                      <TableCell>{formatDuration(run.durationSeconds)}</TableCell>
+                      <TableCell align="right">
+                        {new Date(run.createdAt).toLocaleString()}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </InfoCard>
+        </Grid>
+      )}
 
       {/* Detailed Scorecard Checks */}
       <Grid item xs={12}>
@@ -439,7 +564,7 @@ export const PlatformInsightsPage = () => {
 
       {/* Recent Delivery Timeline */}
       <Grid item xs={12}>
-        <InfoCard title="Recent Delivery Activity (DORA Source Events)">
+        <InfoCard title="Recent Git Delivery History">
           <Divider />
           <Table size="small">
             <TableHead>

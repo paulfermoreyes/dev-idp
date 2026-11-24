@@ -42,9 +42,26 @@ export interface DeliveryEvent {
   category: 'feature' | 'fix' | 'revert' | 'chore';
 }
 
+export interface WorkflowRunSummary {
+  id: number;
+  name: string;
+  workflowPath: string;
+  status: string;
+  conclusion: string | null;
+  branch: string;
+  sha: string;
+  commitMessage: string;
+  createdAt: string;
+  updatedAt: string;
+  durationSeconds: number;
+  htmlUrl: string;
+  isDeployment: boolean;
+}
+
 export interface PlatformInsightsReport {
   entityName: string;
   repoPath: string;
+  projectSlug: string | null;
   evaluatedAt: string;
   scorecard: {
     score: number;
@@ -55,13 +72,35 @@ export interface PlatformInsightsReport {
     checks: ScorecardCheck[];
   };
   dora: {
+    source: 'github-actions' | 'git-fallback';
+    sourceNote: string;
     windowDays: number;
     totalCommits: number;
+    totalDeployRuns: number;
     deploymentFrequency: DoraMetric;
     leadTimeForChanges: DoraMetric;
     changeFailureRate: DoraMetric;
     meanTimeToRecovery: DoraMetric;
     recentDeliveries: DeliveryEvent[];
+    workflowRuns: WorkflowRunSummary[];
+  };
+}
+
+interface GitHubWorkflowRunApi {
+  id: number;
+  name: string;
+  path?: string;
+  status: string;
+  conclusion: string | null;
+  head_branch: string;
+  head_sha: string;
+  created_at: string;
+  updated_at: string;
+  run_started_at?: string;
+  html_url: string;
+  head_commit?: {
+    message?: string;
+    timestamp?: string;
   };
 }
 
@@ -286,7 +325,82 @@ function classifyCommit(subject: string): DeliveryEvent['category'] {
   return 'chore';
 }
 
-async function evaluateDora(repoPath: string): Promise<PlatformInsightsReport['dora']> {
+function isDeploymentWorkflow(run: GitHubWorkflowRunApi): boolean {
+  const name = (run.name || '').toLowerCase();
+  const wfPath = (run.path || '').toLowerCase();
+  return (
+    wfPath.includes('deploy') ||
+    name.includes('deploy') ||
+    name.includes('release') ||
+    name.includes('pages')
+  );
+}
+
+async function fetchGitHubWorkflowRuns(
+  projectSlug: string,
+): Promise<{ runs: WorkflowRunSummary[]; raw: GitHubWorkflowRunApi[]; authMode: string } | null> {
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(projectSlug)) {
+    return null;
+  }
+
+  const headers: Record<string, string> = {
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'backstage-platform-insights',
+  };
+
+  const token = process.env.GITHUB_TOKEN;
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${projectSlug}/actions/runs?per_page=30`,
+      { headers, signal: controller.signal },
+    );
+    if (!res.ok) {
+      return null;
+    }
+    const payload = (await res.json()) as { workflow_runs?: GitHubWorkflowRunApi[] };
+    const raw = payload.workflow_runs || [];
+
+    const runs: WorkflowRunSummary[] = raw.slice(0, 15).map(r => {
+      const startMs = new Date(r.run_started_at || r.created_at).getTime();
+      const endMs = new Date(r.updated_at).getTime();
+      const durationSeconds = Math.max(0, Math.round((endMs - startMs) / 1000));
+      return {
+        id: r.id,
+        name: r.name,
+        workflowPath: r.path || '',
+        status: r.status,
+        conclusion: r.conclusion,
+        branch: r.head_branch,
+        sha: (r.head_sha || '').slice(0, 7),
+        commitMessage: (r.head_commit?.message || '').split('\n')[0],
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+        durationSeconds,
+        htmlUrl: r.html_url,
+        isDeployment: isDeploymentWorkflow(r),
+      };
+    });
+
+    return {
+      runs,
+      raw,
+      authMode: token ? 'authenticated (GITHUB_TOKEN)' : 'unauthenticated (public API)',
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readGitCommits(repoPath: string) {
   let rawLog = '';
   try {
     const { stdout } = await execFileAsync(
@@ -300,7 +414,7 @@ async function evaluateDora(repoPath: string): Promise<PlatformInsightsReport['d
   }
 
   const lines = rawLog ? rawLog.split('\n').filter(Boolean) : [];
-  const commits = lines.map(line => {
+  return lines.map(line => {
     const [sha, authorTs, commitTs, author, ...subjectParts] = line.split('|');
     const subject = subjectParts.join('|');
     const aTs = Number(authorTs) || 0;
@@ -314,39 +428,182 @@ async function evaluateDora(repoPath: string): Promise<PlatformInsightsReport['d
       category: classifyCommit(subject),
     };
   });
+}
 
+async function evaluateDora(
+  repoPath: string,
+  projectSlug: string | null,
+): Promise<PlatformInsightsReport['dora']> {
+  const commits = await readGitCommits(repoPath);
+  const recentDeliveries: DeliveryEvent[] = commits.slice(0, 10).map(c => ({
+    sha: c.sha,
+    subject: c.subject,
+    author: c.author,
+    date: new Date(c.commitTs * 1000).toISOString(),
+    category: c.category,
+  }));
+
+  // Try Live GitHub Actions Telemetry first
+  const ghData = projectSlug ? await fetchGitHubWorkflowRuns(projectSlug) : null;
+  const completedDeployRuns = ghData
+    ? ghData.raw.filter(r => isDeploymentWorkflow(r) && r.status === 'completed')
+    : [];
+
+  if (ghData && completedDeployRuns.length > 0) {
+    const successfulDeploys = completedDeployRuns.filter(r => r.conclusion === 'success');
+    const failedDeploys = completedDeployRuns.filter(
+      r => r.conclusion === 'failure' || r.conclusion === 'timed_out',
+    );
+
+    const nowMs = Date.now();
+    const oldestMs = Math.min(
+      ...completedDeployRuns.map(r => new Date(r.created_at).getTime()),
+    );
+    const spanDays = Math.max(1, Math.ceil((nowMs - oldestMs) / 86400000));
+    const weeks = Math.max(1, spanDays / 7);
+
+    // 1. Deployment Frequency (successful deploys per week)
+    const deploysPerWeek = Number((successfulDeploys.length / weeks).toFixed(1));
+    let dfBand: DoraMetric['band'] = 'Low';
+    if (deploysPerWeek >= 7) dfBand = 'Elite';
+    else if (deploysPerWeek >= 1) dfBand = 'High';
+    else if (deploysPerWeek >= 0.25) dfBand = 'Medium';
+
+    // 2. Lead Time for Changes (commit timestamp -> successful deploy updated_at)
+    const leadMinutes: number[] = [];
+    for (const run of successfulDeploys) {
+      const commitTs = run.head_commit?.timestamp
+        ? new Date(run.head_commit.timestamp).getTime()
+        : new Date(run.created_at).getTime();
+      const deployDoneTs = new Date(run.updated_at).getTime();
+      const mins = (deployDoneTs - commitTs) / 60000;
+      if (mins >= 0 && mins < 43200) {
+        leadMinutes.push(mins);
+      }
+    }
+    leadMinutes.sort((a, b) => a - b);
+    const medianLeadMins =
+      leadMinutes.length > 0
+        ? leadMinutes[Math.floor(leadMinutes.length / 2)]
+        : 0;
+    const medianLeadHours = medianLeadMins / 60;
+
+    let ltBand: DoraMetric['band'] = 'Low';
+    if (medianLeadHours < 24) ltBand = 'Elite';
+    else if (medianLeadHours < 168) ltBand = 'High';
+    else if (medianLeadHours < 720) ltBand = 'Medium';
+
+    const leadTimeDisplay =
+      medianLeadMins < 60
+        ? `${Math.max(1, Math.round(medianLeadMins))} mins`
+        : `${medianLeadHours.toFixed(1)} hrs`;
+
+    // 3. Change Failure Rate (% of completed deploy runs that failed)
+    const cfrPct = Number(
+      ((failedDeploys.length / completedDeployRuns.length) * 100).toFixed(1),
+    );
+    let cfrBand: DoraMetric['band'] = 'Low';
+    if (cfrPct <= 5) cfrBand = 'Elite';
+    else if (cfrPct <= 15) cfrBand = 'High';
+    else if (cfrPct <= 30) cfrBand = 'Medium';
+
+    // 4. Mean Time to Recovery (failed deploy -> next successful deploy)
+    const chronoDeploys = [...completedDeployRuns].sort(
+      (a, b) => new Date(a.updated_at).getTime() - new Date(b.updated_at).getTime(),
+    );
+    const recoveryMins: number[] = [];
+    let activeFailureTs: number | null = null;
+    for (const run of chronoDeploys) {
+      const ts = new Date(run.updated_at).getTime();
+      if (run.conclusion === 'failure' || run.conclusion === 'timed_out') {
+        if (activeFailureTs === null) activeFailureTs = ts;
+      } else if (run.conclusion === 'success' && activeFailureTs !== null) {
+        recoveryMins.push(Math.max(1, (ts - activeFailureTs) / 60000));
+        activeFailureTs = null;
+      }
+    }
+    const avgRecoveryMins =
+      recoveryMins.length > 0
+        ? recoveryMins.reduce((a, b) => a + b, 0) / recoveryMins.length
+        : 0;
+    const avgRecoveryHours = avgRecoveryMins / 60;
+
+    let mttrBand: DoraMetric['band'] = 'Elite';
+    if (avgRecoveryHours > 168) mttrBand = 'Low';
+    else if (avgRecoveryHours > 24) mttrBand = 'Medium';
+    else if (avgRecoveryHours > 1) mttrBand = 'High';
+
+    const mttrDisplay =
+      recoveryMins.length === 0
+        ? '0 mins (Clean)'
+        : avgRecoveryMins < 60
+          ? `${Math.round(avgRecoveryMins)} mins`
+          : `${avgRecoveryHours.toFixed(1)} hrs`;
+
+    return {
+      source: 'github-actions',
+      sourceNote: `Live GitHub Actions API (${projectSlug} • ${ghData.authMode})`,
+      windowDays: spanDays,
+      totalCommits: commits.length,
+      totalDeployRuns: completedDeployRuns.length,
+      deploymentFrequency: {
+        label: 'Deployment Frequency',
+        value: `${deploysPerWeek} / week`,
+        band: dfBand,
+        detail: `${successfulDeploys.length} successful deploy run(s) across ${spanDays} day(s)`,
+      },
+      leadTimeForChanges: {
+        label: 'Lead Time for Changes',
+        value: leadTimeDisplay,
+        band: ltBand,
+        detail: 'Median time from commit timestamp to successful GitHub Actions deploy completion',
+      },
+      changeFailureRate: {
+        label: 'Change Failure Rate',
+        value: `${cfrPct}%`,
+        band: cfrBand,
+        detail: `${failedDeploys.length} failed deploy(s) out of ${completedDeployRuns.length} completed runs`,
+      },
+      meanTimeToRecovery: {
+        label: 'Mean Time to Recovery',
+        value: mttrDisplay,
+        band: mttrBand,
+        detail:
+          recoveryMins.length > 0
+            ? `Average time from failed deploy to next green deploy (${recoveryMins.length} incident(s))`
+            : 'Zero failed production deployments in the observed window',
+      },
+      recentDeliveries,
+      workflowRuns: ghData.runs,
+    };
+  }
+
+  // Fallback: Git Commit History Heuristics
   const totalCommits = commits.length;
   const nowSec = Math.floor(Date.now() / 1000);
   const oldestTs = commits.length > 0 ? commits[commits.length - 1].commitTs : nowSec;
   const spanDays = Math.max(1, Math.ceil((nowSec - oldestTs) / 86400));
   const weeks = Math.max(1, spanDays / 7);
 
-  // 1. Deployment Frequency (main-branch commits trigger deploy.yml)
   const deploysPerWeek = Number((totalCommits / weeks).toFixed(1));
   let dfBand: DoraMetric['band'] = 'Low';
   if (deploysPerWeek >= 7) dfBand = 'Elite';
   else if (deploysPerWeek >= 1) dfBand = 'High';
   else if (deploysPerWeek >= 0.25) dfBand = 'Medium';
 
-  // 2. Lead Time for Changes (median time between consecutive changes / author-to-commit)
   const deltasHours: number[] = [];
   for (let i = 0; i < commits.length - 1; i++) {
     const diffHours = Math.abs(commits[i].commitTs - commits[i + 1].commitTs) / 3600;
-    if (diffHours > 0 && diffHours < 720) {
-      deltasHours.push(diffHours);
-    }
+    if (diffHours > 0 && diffHours < 720) deltasHours.push(diffHours);
   }
   deltasHours.sort((a, b) => a - b);
   const medianLeadHours =
-    deltasHours.length > 0
-      ? deltasHours[Math.floor(deltasHours.length / 2)]
-      : 1;
+    deltasHours.length > 0 ? deltasHours[Math.floor(deltasHours.length / 2)] : 1;
   let ltBand: DoraMetric['band'] = 'Low';
   if (medianLeadHours < 24) ltBand = 'Elite';
   else if (medianLeadHours < 168) ltBand = 'High';
   else if (medianLeadHours < 720) ltBand = 'Medium';
 
-  // 3. Change Failure Rate (% of commits that are fix/revert)
   const failureCommits = commits.filter(
     c => c.category === 'fix' || c.category === 'revert',
   );
@@ -359,12 +616,10 @@ async function evaluateDora(repoPath: string): Promise<PlatformInsightsReport['d
   else if (cfrPct <= 15) cfrBand = 'High';
   else if (cfrPct <= 30) cfrBand = 'Medium';
 
-  // 4. Mean Time to Recovery (average time from preceding commit to fix/revert)
   const recoveryHours: number[] = [];
   for (let i = 0; i < commits.length - 1; i++) {
     if (commits[i].category === 'fix' || commits[i].category === 'revert') {
-      const rec = Math.abs(commits[i].commitTs - commits[i + 1].commitTs) / 3600;
-      recoveryHours.push(rec);
+      recoveryHours.push(Math.abs(commits[i].commitTs - commits[i + 1].commitTs) / 3600);
     }
   }
   const avgMttrHours =
@@ -377,13 +632,16 @@ async function evaluateDora(repoPath: string): Promise<PlatformInsightsReport['d
   else if (avgMttrHours > 1) mttrBand = 'High';
 
   return {
+    source: 'git-fallback',
+    sourceNote: 'Local Git commit history (GitHub Actions API unavailable or no completed deploy runs)',
     windowDays: spanDays,
     totalCommits,
+    totalDeployRuns: 0,
     deploymentFrequency: {
       label: 'Deployment Frequency',
       value: `${deploysPerWeek} / week`,
       band: dfBand,
-      detail: `${totalCommits} main-branch releases across ${spanDays} day(s) (each push triggers deploy.yml)`,
+      detail: `${totalCommits} main-branch releases across ${spanDays} day(s)`,
     },
     leadTimeForChanges: {
       label: 'Lead Time for Changes',
@@ -395,27 +653,20 @@ async function evaluateDora(repoPath: string): Promise<PlatformInsightsReport['d
       label: 'Change Failure Rate',
       value: `${cfrPct}%`,
       band: cfrBand,
-      detail: `${failureCommits.length} fix/revert commit(s) out of ${totalCommits} total deliveries`,
+      detail: `${failureCommits.length} fix/revert commit(s) out of ${totalCommits} deliveries`,
     },
     meanTimeToRecovery: {
       label: 'Mean Time to Recovery',
       value:
-        recoveryHours.length > 0
-          ? `${avgMttrHours.toFixed(1)} hrs`
-          : '0 hrs (Clean)',
+        recoveryHours.length > 0 ? `${avgMttrHours.toFixed(1)} hrs` : '0 hrs (Clean)',
       band: mttrBand,
       detail:
         recoveryHours.length > 0
           ? `Average recovery across ${recoveryHours.length} remediation commit(s)`
           : 'No rollbacks or hotfixes recorded in current window',
     },
-    recentDeliveries: commits.slice(0, 10).map(c => ({
-      sha: c.sha,
-      subject: c.subject,
-      author: c.author,
-      date: new Date(c.commitTs * 1000).toISOString(),
-      category: c.category,
-    })),
+    recentDeliveries,
+    workflowRuns: ghData?.runs || [],
   };
 }
 
@@ -437,6 +688,9 @@ export const platformInsightsPlugin = createBackendPlugin({
         router.get('/evaluate', async (req, res) => {
           const entityName = String(req.query.entityName || 'unknown');
           const repoPath = String(req.query.repoPath || '');
+          const projectSlug = req.query.projectSlug
+            ? String(req.query.projectSlug)
+            : null;
 
           if (!repoPath || !path.isAbsolute(repoPath) || !fs.existsSync(repoPath)) {
             res.status(400).json({
@@ -448,11 +702,12 @@ export const platformInsightsPlugin = createBackendPlugin({
 
           try {
             const scorecard = evaluateScorecard(repoPath);
-            const dora = await evaluateDora(repoPath);
+            const dora = await evaluateDora(repoPath, projectSlug);
 
             const report: PlatformInsightsReport = {
               entityName,
               repoPath,
+              projectSlug,
               evaluatedAt: new Date().toISOString(),
               scorecard,
               dora,
@@ -465,7 +720,6 @@ export const platformInsightsPlugin = createBackendPlugin({
           }
         });
 
-        // Allow unauthenticated reads for local dev portal exploration
         httpRouter.addAuthPolicy({
           path: '/health',
           allow: 'unauthenticated',
@@ -476,7 +730,7 @@ export const platformInsightsPlugin = createBackendPlugin({
         });
 
         httpRouter.use(router);
-        logger.info('Platform Insights backend plugin initialized (Scorecards & DORA)');
+        logger.info('Platform Insights backend plugin initialized (Scorecards & Live GitHub Actions DORA)');
       },
     });
   },
